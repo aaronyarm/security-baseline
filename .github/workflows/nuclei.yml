@@ -1,0 +1,76 @@
+# Reusable weekly nuclei scan. Report-only, polite rate limits.
+# Only pass targets that you own and have confirmed.
+name: nuclei-baseline
+
+on:
+  workflow_call:
+    inputs:
+      targets:
+        description: "Newline- or comma-separated URLs that you own."
+        type: string
+        required: true
+      rate-limit:
+        description: "Max requests per second."
+        type: number
+        default: 10
+      severity:
+        description: "Template severities to run."
+        type: string
+        default: "low,medium,high,critical"
+      exclude-tags:
+        description: "Template tags to skip (keeps the scan non-intrusive)."
+        type: string
+        default: "dos,fuzz,intrusive,bruteforce,osint"
+
+permissions: {}
+
+env:
+  NUCLEI_VERSION: "3.11.1"
+  NUCLEI_SHA256: "ea63d4ae232808cd7c6bc00d0142428e231fab59dae01042246097d195835ab6"
+
+jobs:
+  nuclei:
+    name: nuclei
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Install nuclei
+        run: |
+          curl -sSfL -o nuclei.zip "https://github.com/projectdiscovery/nuclei/releases/download/v${NUCLEI_VERSION}/nuclei_${NUCLEI_VERSION}_linux_amd64.zip"
+          echo "${NUCLEI_SHA256}  nuclei.zip" | sha256sum -c -
+          unzip -q nuclei.zip nuclei && sudo mv nuclei /usr/local/bin/ && rm nuclei.zip
+          nuclei -version
+
+      - name: Scan
+        env:
+          TARGETS: ${{ inputs.targets }}
+          RATE: ${{ inputs.rate-limit }}
+          SEVERITY: ${{ inputs.severity }}
+          EXCLUDE_TAGS: ${{ inputs.exclude-tags }}
+        run: |
+          printf '%s\n' "$TARGETS" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$' > targets.txt
+          echo "Targets: $(wc -l < targets.txt)"
+          nuclei -l targets.txt -severity "$SEVERITY" -exclude-tags "$EXCLUDE_TAGS" \
+            -rate-limit "$RATE" -concurrency 5 -bulk-size 5 -timeout 10 -retries 1 \
+            -no-interactsh -disable-update-check -silent -jsonl -o nuclei.jsonl || true
+          touch nuclei.jsonl
+          {
+            echo "## nuclei (report-only)"
+            echo "Findings: $(wc -l < nuclei.jsonl)"
+            echo
+            echo "| Severity | Template | Matched |"
+            echo "|---|---|---|"
+            jq -r '"| \(.info.severity) | \(."template-id") | \(."matched-at") |"' nuclei.jsonl | head -200
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload report artifact
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nuclei-report
+          path: nuclei.jsonl
+          if-no-files-found: ignore
+          retention-days: 30

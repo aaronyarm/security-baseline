@@ -1,0 +1,252 @@
+# Reusable security workflow: gitleaks + trivy + semgrep (+ optional nuclei on schedule).
+# Callers: see README.md. Every third-party action is pinned to a full commit SHA,
+# and every downloaded tool binary is verified against a pinned sha256.
+name: security-baseline
+
+on:
+  workflow_call:
+    inputs:
+      run-gitleaks:
+        description: "Scan new commits for secrets (push / pull_request only). Blocking."
+        type: boolean
+        default: true
+      run-trivy:
+        description: "Scan dependencies and misconfigurations. Blocks on fixable HIGH/CRITICAL."
+        type: boolean
+        default: true
+      run-semgrep:
+        description: "Static analysis with semgrep community rules (push / pull_request only). Report-only."
+        type: boolean
+        default: true
+      trivy-severity-gate:
+        description: "Severities that fail the build (only issues with a fix available)."
+        type: string
+        default: "HIGH,CRITICAL"
+      semgrep-config:
+        description: "Semgrep ruleset."
+        type: string
+        default: "p/default"
+      nuclei-targets:
+        description: "Newline- or comma-separated URLs you own. Scanned on schedule only. Empty = off."
+        type: string
+        default: ""
+
+permissions: {}
+
+env:
+  GITLEAKS_VERSION: "8.30.1"
+  GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+  TRIVY_VERSION: "0.76.2"
+  TRIVY_SHA256: "bc0fc726e017b8927a62b2d3531d7a84ee01769daf5c99ed866dced54089fdbf"
+  SEMGREP_IMAGE: "semgrep/semgrep@sha256:6e1b04340e60e910fbb4ddbf3c857ab0918f064417ad5ac530014ccb3cf8c8f1" # 1.186.0
+
+jobs:
+  meta:
+    name: repo visibility
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      public: ${{ steps.vis.outputs.public }}
+    steps:
+      - id: vis
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          private=$(gh api "repos/${GITHUB_REPOSITORY}" --jq .private)
+          if [ "$private" = "false" ]; then echo "public=true" >> "$GITHUB_OUTPUT"; else echo "public=false" >> "$GITHUB_OUTPUT"; fi
+          echo "Repository private: $private"
+
+  gitleaks:
+    name: gitleaks (secrets)
+    needs: meta
+    if: inputs.run-gitleaks && (github.event_name == 'push' || github.event_name == 'pull_request')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install gitleaks
+        run: |
+          curl -sSfL -o gl.tgz "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  gl.tgz" | sha256sum -c -
+          tar -xzf gl.tgz gitleaks && sudo mv gitleaks /usr/local/bin/ && rm gl.tgz
+          gitleaks version
+
+      - name: Work out commit range
+        id: range
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          if [ "$EVENT" = "pull_request" ]; then
+            range="${PR_BASE}..${PR_HEAD}"
+          elif [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ] && git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+            range="${BEFORE}..${AFTER}"
+          elif [ -n "$DEFAULT_BRANCH" ] && git rev-parse -q --verify "origin/${DEFAULT_BRANCH}" >/dev/null && [ "$(git rev-parse "origin/${DEFAULT_BRANCH}")" != "$AFTER" ]; then
+            # New branch: scan only commits that are not on the default branch yet.
+            range="origin/${DEFAULT_BRANCH}..${AFTER}"
+          else
+            # First push of the default branch: scan only the pushed head commit.
+            range="-1 ${AFTER}"
+          fi
+          echo "range=${range}" >> "$GITHUB_OUTPUT"
+          echo "Scanning: ${range}"
+
+      - name: Scan
+        env:
+          RANGE: ${{ steps.range.outputs.range }}
+        run: |
+          set +e
+          gitleaks git . --log-opts="${RANGE}" --redact --no-banner --exit-code 1 \
+            --report-format sarif --report-path gitleaks.sarif
+          rc=$?
+          {
+            echo "## gitleaks"
+            echo "Range: \`${RANGE}\`"
+            if [ "$rc" = "0" ]; then echo "No leaks found."; else
+              echo "**Leaks found.** Values are redacted. Rotate the credential, then remove it (see README)."
+              echo
+              echo "| Rule | File | Line | Commit |"
+              echo "|---|---|---|---|"
+              jq -r '.runs[0].results[]? | "| \(.ruleId) | \(.locations[0].physicalLocation.artifactLocation.uri) | \(.locations[0].physicalLocation.region.startLine) | \(.partialFingerprints.commitSha[0:8] // "") |"' gitleaks.sarif
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit $rc
+
+      - name: Upload SARIF (public repos)
+        if: always() && needs.meta.outputs.public == 'true' && hashFiles('gitleaks.sarif') != ''
+        uses: github/codeql-action/upload-sarif@1bd86f2fdb4b86187fa4059f16f31a3202acc9ea # v4.39.4
+        with:
+          sarif_file: gitleaks.sarif
+          category: gitleaks
+
+      - name: Upload report artifact
+        if: always() && hashFiles('gitleaks.sarif') != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gitleaks-report
+          path: gitleaks.sarif
+          retention-days: 14
+
+  trivy:
+    name: trivy (dependencies + misconfig)
+    needs: meta
+    if: inputs.run-trivy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install trivy
+        run: |
+          curl -sSfL -o trivy.tgz "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          echo "${TRIVY_SHA256}  trivy.tgz" | sha256sum -c -
+          tar -xzf trivy.tgz trivy && sudo mv trivy /usr/local/bin/ && rm trivy.tgz
+          trivy --version
+
+      - name: Full report (all severities, non-blocking)
+        run: |
+          trivy fs . --scanners vuln,misconfig --format sarif --output trivy.sarif --exit-code 0 --quiet
+
+      - name: Gate (fixable ${{ inputs.trivy-severity-gate }} only)
+        env:
+          GATE: ${{ inputs.trivy-severity-gate }}
+        run: |
+          set +e
+          trivy fs . --scanners vuln,misconfig --severity "$GATE" --ignore-unfixed \
+            --skip-db-update --format table --output trivy-gate.txt --exit-code 1 --quiet
+          rc=$?
+          {
+            echo "## trivy"
+            if [ "$rc" = "0" ]; then echo "No fixable ${GATE} issues."; else echo "**Fixable ${GATE} issues found (build fails):**"; fi
+            echo '```'
+            head -c 60000 trivy-gate.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit $rc
+
+      - name: Upload SARIF (public repos)
+        if: always() && needs.meta.outputs.public == 'true' && hashFiles('trivy.sarif') != ''
+        uses: github/codeql-action/upload-sarif@1bd86f2fdb4b86187fa4059f16f31a3202acc9ea # v4.39.4
+        with:
+          sarif_file: trivy.sarif
+          category: trivy
+
+      - name: Upload report artifact
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: trivy-report
+          path: |
+            trivy.sarif
+            trivy-gate.txt
+          if-no-files-found: ignore
+          retention-days: 14
+
+  semgrep:
+    name: semgrep (report-only)
+    needs: meta
+    if: inputs.run-semgrep && (github.event_name == 'push' || github.event_name == 'pull_request')
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Scan (official container, community rules)
+        env:
+          CONFIG: ${{ inputs.semgrep-config }}
+        run: |
+          docker run --rm -v "${PWD}:/src" -w /src "$SEMGREP_IMAGE" \
+            semgrep scan --config "$CONFIG" --metrics=off --sarif --output semgrep.sarif --quiet || true
+          count=$(jq '[.runs[].results[]] | length' semgrep.sarif 2>/dev/null || echo "?")
+          {
+            echo "## semgrep (report-only)"
+            echo "Findings: ${count}"
+            echo
+            echo "| Rule | File | Line |"
+            echo "|---|---|---|"
+            jq -r '.runs[].results[]? | "| \(.ruleId | split(".") | last) | \(.locations[0].physicalLocation.artifactLocation.uri) | \(.locations[0].physicalLocation.region.startLine) |"' semgrep.sarif 2>/dev/null | head -100
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload SARIF (public repos)
+        if: always() && needs.meta.outputs.public == 'true' && hashFiles('semgrep.sarif') != ''
+        uses: github/codeql-action/upload-sarif@1bd86f2fdb4b86187fa4059f16f31a3202acc9ea # v4.39.4
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+      - name: Upload report artifact
+        if: always() && hashFiles('semgrep.sarif') != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: semgrep-report
+          path: semgrep.sarif
+          retention-days: 14
+
+  nuclei:
+    name: nuclei (scheduled, report-only)
+    if: inputs.nuclei-targets != '' && github.event_name == 'schedule'
+    permissions:
+      contents: read
+    uses: aaronyarm/security-baseline/.github/workflows/nuclei.yml@main
+    with:
+      targets: ${{ inputs.nuclei-targets }}

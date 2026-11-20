@@ -1,0 +1,19 @@
+name: security
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "23 5 * * 1" # weekly, Monday 05:23 UTC (trivy; nuclei if targets are set)
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  security:
+    uses: aaronyarm/security-baseline/.github/workflows/security.yml@main
+    permissions:
+      contents: read
+      security-events: write
+    with:
+      run-semgrep: false # workflow YAML only, no app code
